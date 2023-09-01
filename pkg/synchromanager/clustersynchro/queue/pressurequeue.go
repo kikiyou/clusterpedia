@@ -1,7 +1,11 @@
 package queue
 
 import (
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	"sync"
+	"time"
 
 	"k8s.io/apimachinery/pkg/util/sets"
 )
@@ -18,6 +22,7 @@ func NewPressureQueue(keyFunc KeyFunc) *pressurequeue {
 		items:      map[string]*Event{},
 		queue:      []string{},
 		keyFunc:    keyFunc,
+		workqueue:  NewBasicWorkQueue(clock.RealClock{}),
 	}
 	q.cond.L = &q.lock
 	return q
@@ -32,6 +37,7 @@ type pressurequeue struct {
 	queue      []string
 	keyFunc    KeyFunc
 	closed     bool
+	workqueue  WorkQueue
 }
 
 func (q *pressurequeue) Add(obj interface{}) error {
@@ -59,6 +65,19 @@ func (q *pressurequeue) queueActionLocked(action ActionType, obj interface{}) er
 	key, err := q.keyFunc(obj)
 	if err != nil {
 		return err
+	}
+	if action == Updated && (q.workqueue.Len() < 1000) {
+		obj, ok := obj.(runtime.Object)
+		if !ok {
+			klog.Errorf("%s-runtime not ok", key)
+		}
+		if obj.GetObjectKind().GroupVersionKind().Kind == "Pod" {
+			q.workqueue.Enqueue(key, 5*time.Second)
+		} else {
+			q.workqueue.Enqueue(key, 10*time.Second)
+		}
+	} else {
+		q.workqueue.Enqueue(key, 0)
 	}
 	q.put(key, pressureEvents(q.items[key], &Event{Action: action, Object: obj}))
 	return nil
@@ -120,6 +139,7 @@ func (q *pressurequeue) Pop() (*Event, error) {
 	defer q.lock.Unlock()
 
 	for {
+		q.queue = q.workqueue.GetWork()
 		for len(q.queue) == 0 {
 			if q.closed {
 				return nil, ErrQueueClosed
